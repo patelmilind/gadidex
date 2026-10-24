@@ -39,3 +39,11 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# gadidex local data
+/data
+/public/uploads/*
+!/public/uploads/.gitkeep
+
+# brainstorm visual companion
+.superpowers/
