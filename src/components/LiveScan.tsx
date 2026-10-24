@@ -5,82 +5,25 @@ import { CardMint, type MintCard } from "@/components/CardMint";
 import { awardScan } from "@/lib/progress";
 
 type Phase =
-  | "checking"
-  | "blocked"
-  | "need_motion_permission"
   | "starting"
+  | "blocked"
   | "ready"
-  | "tilting"
-  | "live"
   | "captured"
   | "submitting"
   | "minted";
 
-function isPhoneLike(): boolean {
-  if (typeof navigator === "undefined") return false;
-  const ua = navigator.userAgent;
-  const mobileUa = /Android|iPhone|iPad|iPod|Mobile/i.test(ua);
-  const touch = navigator.maxTouchPoints > 1;
-  return mobileUa || (touch && window.innerWidth < 1024);
-}
-
-function supportsMotion(): boolean {
-  return typeof window !== "undefined" && "DeviceMotionEvent" in window;
-}
-
-async function requestMotionPermission(): Promise<boolean> {
-  type MotionRequest = {
-    requestPermission?: () => Promise<"granted" | "denied" | "default">;
-  };
-  const DEM = DeviceMotionEvent as unknown as MotionRequest;
-  if (typeof DEM.requestPermission !== "function") return true;
-  const result = await DEM.requestPermission();
-  return result === "granted";
-}
-
-function sampleFrame(video: HTMLVideoElement): Float32Array | null {
-  const w = 64;
-  const h = 48;
-  if (video.videoWidth < 16 || video.videoHeight < 16) return null;
-  const canvas = document.createElement("canvas");
-  canvas.width = w;
-  canvas.height = h;
-  const ctx = canvas.getContext("2d", { willReadFrequently: true });
-  if (!ctx) return null;
-  ctx.drawImage(video, 0, 0, w, h);
-  const { data } = ctx.getImageData(0, 0, w, h);
-  const gray = new Float32Array(w * h);
-  for (let i = 0, p = 0; i < data.length; i += 4, p++) {
-    gray[p] = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-  }
-  return gray;
-}
-
-function frameDelta(a: Float32Array, b: Float32Array): number {
-  const n = Math.min(a.length, b.length);
-  let sum = 0;
-  for (let i = 0; i < n; i++) sum += Math.abs(a[i] - b[i]);
-  return sum / n;
-}
-
 export function LiveScan() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const peakAccelRef = useRef(0);
-  const maxFrameDeltaRef = useRef(0);
-  const baselineFrameRef = useRef<Float32Array | null>(null);
-  const sawLeftRef = useRef(false);
-  const sawRightRef = useRef(false);
 
-  const [phase, setPhase] = useState<Phase>("checking");
+  const [phase, setPhase] = useState<Phase>("starting");
   const [blockReason, setBlockReason] = useState<string | null>(null);
-  const [sessionId, setSessionId] = useState<string | null>(null);
   const [coords, setCoords] = useState<{ lat: number; lng: number } | null>(null);
   const [preview, setPreview] = useState<string | null>(null);
   const [blob, setBlob] = useState<Blob | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [hint, setHint] = useState("Starting live camera…");
-  const [statusLine, setStatusLine] = useState("Waiting…");
+  const [hint, setHint] = useState("Opening camera…");
+  const [statusLine, setStatusLine] = useState("Starting…");
   const [mint, setMint] = useState<{
     card: MintCard;
     xpGained: number;
@@ -88,6 +31,7 @@ export function LiveScan() {
   } | null>(null);
 
   useEffect(() => {
+    void startCamera();
     return () => {
       streamRef.current?.getTracks().forEach((t) => t.stop());
       if (preview) URL.revokeObjectURL(preview);
@@ -95,41 +39,32 @@ export function LiveScan() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  async function startPipeline() {
+  async function startCamera() {
     setPhase("starting");
     setError(null);
-    setStatusLine("Locking GPS + camera…");
+    setStatusLine("Opening camera…");
     try {
-      const motionOk = await requestMotionPermission();
-      if (!motionOk) {
-        setBlockReason("Motion permission denied. Allow motion to prove a live tilt.");
+      if (!navigator.mediaDevices?.getUserMedia) {
+        setBlockReason("Camera API unavailable in this browser.");
         setPhase("blocked");
         return;
       }
 
-      const position = await new Promise<GeolocationPosition>((resolve, reject) => {
-        navigator.geolocation.getCurrentPosition(resolve, reject, {
-          enableHighAccuracy: true,
-          timeout: 12_000,
-          maximumAge: 0,
+      if (navigator.geolocation) {
+        const position = await new Promise<GeolocationPosition | null>((resolve) => {
+          navigator.geolocation.getCurrentPosition(
+            (pos) => resolve(pos),
+            () => resolve(null),
+            { enableHighAccuracy: false, timeout: 4000, maximumAge: 60_000 },
+          );
         });
-      }).catch(() => null);
-      if (!position) {
-        setBlockReason("GPS required. Enable location and try again outdoors.");
-        setPhase("blocked");
-        return;
+        if (position) {
+          setCoords({
+            lat: position.coords.latitude,
+            lng: position.coords.longitude,
+          });
+        }
       }
-      setCoords({
-        lat: position.coords.latitude,
-        lng: position.coords.longitude,
-      });
-
-      const sessionRes = await fetch("/api/scan/session", { method: "POST" });
-      const sessionData = await sessionRes.json();
-      if (!sessionRes.ok) {
-        throw new Error(sessionData.error || "Could not start scan session");
-      }
-      setSessionId(sessionData.sessionId);
 
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: false,
@@ -146,147 +81,28 @@ export function LiveScan() {
       await video.play();
 
       setPhase("ready");
-      setStatusLine("Live · GPS locked");
-      setHint("Frame a real car, then start the tilt check.");
+      setStatusLine("Live camera");
+      setHint("Point at a car, then capture.");
     } catch (err) {
       setBlockReason(
         err instanceof Error
           ? err.message
-          : "Could not start live scan. Check camera and location permissions.",
+          : "Could not open the camera. Allow camera permission and try again.",
       );
       setPhase("blocked");
     }
   }
 
+  // Refresh status once coords resolve after camera start
   useEffect(() => {
-    async function boot() {
-      if (!isPhoneLike()) {
-        setBlockReason(
-          "Scan needs a phone or tablet with a rear camera, GPS, and motion sensors.",
-        );
-        setPhase("blocked");
-        return;
-      }
-      if (!supportsMotion()) {
-        setBlockReason("This browser has no motion sensors. Use Safari/Chrome on your phone.");
-        setPhase("blocked");
-        return;
-      }
-      if (!navigator.mediaDevices?.getUserMedia) {
-        setBlockReason("Camera API unavailable in this browser.");
-        setPhase("blocked");
-        return;
-      }
-      if (!navigator.geolocation) {
-        setBlockReason("GPS is required. Enable location services.");
-        setPhase("blocked");
-        return;
-      }
-
-      type MotionRequest = {
-        requestPermission?: () => Promise<"granted" | "denied" | "default">;
-      };
-      const needsTap =
-        typeof (DeviceMotionEvent as unknown as MotionRequest).requestPermission ===
-        "function";
-      if (needsTap) {
-        setPhase("need_motion_permission");
-        setHint("Tap to allow motion sensors, then we open the rear camera.");
-        setStatusLine("Needs permission");
-        return;
-      }
-
-      await startPipeline();
+    if (phase === "ready") {
+      setStatusLine(coords ? "Live + GPS" : "Live camera");
     }
-    void boot();
-  }, []);
-
-  useEffect(() => {
-    if (phase !== "tilting" && phase !== "ready" && phase !== "live") return;
-
-    function onMotion(event: DeviceMotionEvent) {
-      const acc = event.accelerationIncludingGravity;
-      if (!acc) return;
-      const mag = Math.sqrt(
-        (acc.x ?? 0) ** 2 + (acc.y ?? 0) ** 2 + (acc.z ?? 0) ** 2,
-      );
-      const delta = Math.abs(mag - 9.8);
-      if (delta > peakAccelRef.current) peakAccelRef.current = delta;
-      const x = acc.x ?? 0;
-      if (x < -2.5) sawLeftRef.current = true;
-      if (x > 2.5) sawRightRef.current = true;
-    }
-
-    window.addEventListener("devicemotion", onMotion);
-    return () => window.removeEventListener("devicemotion", onMotion);
-  }, [phase]);
-
-  useEffect(() => {
-    if (phase !== "tilting") return;
-    const video = videoRef.current;
-    if (!video) return;
-
-    const id = window.setInterval(() => {
-      const frame = sampleFrame(video);
-      if (!frame) return;
-      if (!baselineFrameRef.current) {
-        baselineFrameRef.current = frame;
-        return;
-      }
-      const d = frameDelta(baselineFrameRef.current, frame);
-      if (d > maxFrameDeltaRef.current) maxFrameDeltaRef.current = d;
-    }, 200);
-
-    return () => window.clearInterval(id);
-  }, [phase]);
-
-  async function beginTilt() {
-    setError(null);
-    peakAccelRef.current = 0;
-    maxFrameDeltaRef.current = 0;
-    baselineFrameRef.current = null;
-    sawLeftRef.current = false;
-    sawRightRef.current = false;
-    setPhase("tilting");
-    setStatusLine("Liveness · tilt");
-    setHint("Tilt the phone left, then right — keep the car in view.");
-  }
-
-  async function finishTilt() {
-    setError(null);
-    if (!sessionId) {
-      setError("Missing scan session.");
-      return;
-    }
-    if (!sawLeftRef.current || !sawRightRef.current) {
-      setError("Tilt left and right so sensors register both directions.");
-      return;
-    }
-    const res = await fetch("/api/scan/liveness", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        sessionId,
-        peakAccel: peakAccelRef.current,
-        frameDelta: maxFrameDeltaRef.current,
-      }),
-    });
-    const data = await res.json();
-    if (!res.ok) {
-      setError(data.error || "Liveness check failed");
-      setPhase("ready");
-      setStatusLine("Live · GPS locked");
-      setHint("Try the tilt again with a clearer view of the car.");
-      return;
-    }
-    setPhase("live");
-    setStatusLine("Ready to capture");
-    setHint("Liveness passed. Capture the car.");
-  }
+  }, [coords, phase]);
 
   async function capture() {
     const video = videoRef.current;
-    if (!video || !sessionId || !coords) return;
+    if (!video) return;
     setError(null);
     const canvas = document.createElement("canvas");
     canvas.width = video.videoWidth || 1280;
@@ -308,12 +124,12 @@ export function LiveScan() {
     setBlob(nextBlob);
     setPreview(URL.createObjectURL(nextBlob));
     setPhase("captured");
-    setStatusLine("Frozen frame");
-    setHint("Mint it, or retake.");
+    setStatusLine("Ready to mint");
+    setHint("Looks good? Mint the card, or retake.");
   }
 
   async function submit() {
-    if (!blob || !sessionId || !coords) return;
+    if (!blob) return;
     setPhase("submitting");
     setError(null);
     setStatusLine("Recognizing…");
@@ -321,9 +137,10 @@ export function LiveScan() {
       await fetch("/api/auth/guest", { method: "POST" });
       const body = new FormData();
       body.set("image", blob, "live-capture.jpg");
-      body.set("sessionId", sessionId);
-      body.set("lat", String(coords.lat));
-      body.set("lng", String(coords.lng));
+      if (coords) {
+        body.set("lat", String(coords.lat));
+        body.set("lng", String(coords.lng));
+      }
       const res = await fetch("/api/recognize", { method: "POST", body });
       const data = await res.json();
       if (!res.ok) {
@@ -339,42 +156,23 @@ export function LiveScan() {
       setStatusLine("Card minted");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Scan failed");
-      setPhase("live");
-      setHint("Capture again from the live camera.");
-      setStatusLine("Retry capture");
-      try {
-        const sessionRes = await fetch("/api/scan/session", { method: "POST" });
-        const sessionData = await sessionRes.json();
-        if (sessionRes.ok) {
-          setSessionId(sessionData.sessionId);
-          setPhase("ready");
-          setBlob(null);
-          if (preview) URL.revokeObjectURL(preview);
-          setPreview(null);
-          setHint("Session refreshed. Run the tilt check again, then capture.");
-          setStatusLine("Live · GPS locked");
-        }
-      } catch {
-        /* ignore */
-      }
+      setPhase("ready");
+      setBlob(null);
+      if (preview) URL.revokeObjectURL(preview);
+      setPreview(null);
+      setHint("Try capturing again.");
+      setStatusLine(coords ? "Live + GPS" : "Live camera");
     }
   }
 
-  async function resetAfterMint() {
+  function resetAfterMint() {
     setMint(null);
     setBlob(null);
     if (preview) URL.revokeObjectURL(preview);
     setPreview(null);
     setError(null);
-    try {
-      const sessionRes = await fetch("/api/scan/session", { method: "POST" });
-      const sessionData = await sessionRes.json();
-      if (sessionRes.ok) setSessionId(sessionData.sessionId);
-    } catch {
-      /* ignore */
-    }
     setPhase("ready");
-    setStatusLine("Live · GPS locked");
+    setStatusLine(coords ? "Live + GPS" : "Live camera");
     setHint("Hunt the next car.");
   }
 
@@ -382,9 +180,9 @@ export function LiveScan() {
     return (
       <div className="panel scan-blocked">
         <p className="error">{blockReason}</p>
-        <p className="muted">
-          Gallery upload is off. Spot a real car on the street with your phone.
-        </p>
+        <button className="btn btn-primary" type="button" onClick={() => void startCamera()}>
+          Try again
+        </button>
       </div>
     );
   }
@@ -407,7 +205,7 @@ export function LiveScan() {
           />
           {preview ? (
             // eslint-disable-next-line @next/next/no-img-element
-            <img className="viewfinder-freeze" src={preview} alt="Live capture" />
+            <img className="viewfinder-freeze" src={preview} alt="Capture preview" />
           ) : null}
           <div className="viewfinder-frame" aria-hidden />
           <p className="viewfinder-hint">{hint}</p>
@@ -416,34 +214,11 @@ export function LiveScan() {
         {error ? <p className="error">{error}</p> : null}
 
         <div className="scan-actions">
-          {phase === "need_motion_permission" || phase === "checking" ? (
-            <button className="btn btn-primary btn-pulse" type="button" onClick={() => void startPipeline()}>
-              Allow sensors & open camera
-            </button>
-          ) : null}
-
           {phase === "starting" ? (
-            <p className="muted">Requesting camera, GPS, and scan session…</p>
+            <p className="muted">Opening camera…</p>
           ) : null}
 
           {phase === "ready" ? (
-            <button className="btn btn-primary" type="button" onClick={() => void beginTilt()}>
-              Start tilt check
-            </button>
-          ) : null}
-
-          {phase === "tilting" ? (
-            <>
-              <button className="btn btn-primary" type="button" onClick={() => void finishTilt()}>
-                I&apos;ve tilted — verify
-              </button>
-              <button className="btn btn-ghost" type="button" onClick={() => void beginTilt()}>
-                Reset tilt
-              </button>
-            </>
-          ) : null}
-
-          {phase === "live" ? (
             <button className="btn btn-primary btn-shutter" type="button" onClick={() => void capture()}>
               Capture
             </button>
@@ -461,9 +236,9 @@ export function LiveScan() {
                   if (preview) URL.revokeObjectURL(preview);
                   setPreview(null);
                   setBlob(null);
-                  setPhase("live");
-                  setStatusLine("Ready to capture");
-                  setHint("Capture again from the live stream.");
+                  setPhase("ready");
+                  setStatusLine(coords ? "Live + GPS" : "Live camera");
+                  setHint("Point at a car, then capture.");
                 }}
               >
                 Retake
@@ -472,7 +247,7 @@ export function LiveScan() {
           ) : null}
 
           {phase === "submitting" ? (
-            <p className="muted scan-loading">Checking street photo & minting…</p>
+            <p className="muted scan-loading">Recognizing & minting…</p>
           ) : null}
         </div>
       </div>
@@ -482,7 +257,7 @@ export function LiveScan() {
           card={mint.card}
           xpGained={mint.xpGained}
           streak={mint.streak}
-          onClose={() => void resetAfterMint()}
+          onClose={resetAfterMint}
         />
       ) : null}
     </>
